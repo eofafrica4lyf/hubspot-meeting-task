@@ -262,6 +262,113 @@ const processContacts = async (domain, hubId, q) => {
   return true;
 };
 
+/**
+ * Get recently modified meetings as 100 meetings per page
+ */
+
+const processMeetings = async (domain, hubId, actionQueue) => {
+  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId)
+  const lastPulledDate = new Date(account._doc.lastPulledDates.meetings)
+  const now = new Date();
+
+  let hasMore = true;
+  let meetingOffset;
+  const properties = [
+    'hs_meeting_title',
+    'hs_meeting_body',
+    'hubspot_owner_id'
+  ]
+  const maxRetries = 4;
+  const limit = 100;
+  let meetingContactsDict = {};
+
+  while(hasMore) {
+    let tryCount = 0;
+    let meetingEngagements = {};
+    while(tryCount <= maxRetries) {
+      try {
+        const meetingsData = (await (await hubspotClient.apiRequest({
+          method: 'get',
+          path: `/engagements/v1/engagements/paged?type=MEETING&limit=${limit}${meetingOffset ?'&offset='+meetingOffset : '' }&properties=${properties.join(',')}`,
+        })).json())
+        hasMore = meetingsData.hasMore
+        if (hasMore) meetingOffset = meetingsData.offset
+        meetingEngagements = meetingsData?.results || [];
+        break;
+      } catch (error) {
+        tryCount++;
+
+        if(new Date() > expirationDate) await refreshAccessToken(domain, hubId);
+
+        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
+      }
+    }
+    
+    if(!meetingEngagements) throw new Error(`Failed to fetch meetings for ${maxRetries} times. Aborting.`)
+
+    tryCount = 0;//use counter again for second request to get associated contacts
+    
+    while(tryCount <= maxRetries) {
+      try {
+        let meetingContacts = []
+        if(!!meetingEngagements) {
+          meetingContacts =  (await (await hubspotClient.apiRequest({
+            method: 'post',
+            path: '/crm/v3/objects/contacts/batch/read', 
+            body: { inputs: Array.from(new Set(meetingEngagements.reduce((a,b) => [...a, ...b.associations.contactIds], []))).map(id => ({id})) }//task: given time, implement a cache on the dict for contacts so that they are not re-fetched when meetings are fetched from multiple pages
+          })).json())?.results || [];
+      
+          meetingContactsDict = {...meetingContactsDict, ...Object.fromEntries(meetingContacts.map(data => ([data.id, data]))) } 
+        }
+        break;  
+      } catch (error) {
+        tryCount++;
+
+        if(new Date() > expirationDate) await refreshAccessToken(domain, hubId);
+
+        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
+      }
+    }
+
+    //Aggregate meetings and contacts details, then, create actions
+    meetingEngagements.forEach(meetingEngagement => {
+      const isCreated = new Date(meetingEngagement.engagement.createdAt) > lastPulledDate;
+
+      const actionTemplate = {
+        actionName: isCreated ? "Meeting Created" : "Meeting Updated",
+        meetingTitle: meetingEngagement.engagement.bodyPreview, //leaving this intentionally as undefined is the bodyPreview property is missing
+        createdAt: new Date(meetingEngagement.engagement.createdAt).toISOString(),
+        updatedAt: new Date(meetingEngagement.engagement.lastUpdated).toISOString(),
+      }
+
+      let contacts = []
+      if(meetingEngagement.associations.contactIds.length > 0) {
+        meetingEngagement.associations.contactIds.forEach(contactId => {
+          if(meetingContactsDict[contactId]) {
+            const {id, properties} = meetingContactsDict[contactId]
+            contacts.push({
+              id, 
+              email: properties.email,
+              firstName: properties.firstname,
+              lastName: properties.lastname
+            })
+          } 
+        })
+      }
+      actionTemplate.contacts = contacts;
+      actionTemplate.contactEmails = contacts.map(contact => contact.email).join(',');
+
+      actionQueue.push(actionTemplate);
+    })
+
+  }
+
+  account.lastPulledDates.meetings = now;
+  await saveDomain(domain);
+
+  return true;
+}
+
 const createQueue = (domain, actions) => queue(async (action, callback) => {
   actions.push(action);
 
@@ -316,6 +423,13 @@ const pullDataFromHubspot = async () => {
       console.log('process companies');
     } catch (err) {
       console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processCompanies', hubId: account.hubId } });
+    }
+
+    try {
+      await processMeetings(domain, account.hubId, q);
+      console.log('process meetings');
+    } catch (error) {
+      console.log(error, {apiKey: domain.apiKey, metadata: {operation: 'processMeetings', hubId: account.hubId } });
     }
 
     try {
